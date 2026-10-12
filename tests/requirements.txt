@@ -1,0 +1,7 @@
+# Match the integration's declared minimum Home Assistant version; Python 3.13.
+homeassistant==2025.5.0
+pytest>=8,<10
+pytest-asyncio>=0.24,<2
+# SmartIR's existing __init__.py imports distutils.version.
+setuptools>=75,<81
+aiofiles>=0.6.0
