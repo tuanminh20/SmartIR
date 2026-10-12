@@ -14,6 +14,7 @@ are controlled for deterministic settling tests. The IR controller is mocked;
 every feedback scenario asserts that it receives no commands. A separate test
 checks that normal fan control still sends commands.
 
-The nine-speed device data and watt ranges are synthetic fixtures. They do not
-validate Panasonic IR codes or establish real-world watt thresholds. Hardware
-calibration and a Home Assistant deployment are still required before use.
+The tests load the Panasonic 1221 device file supplied by the user. Watt ranges
+remain synthetic fixtures; they do not establish real-world watt thresholds.
+The controller is mocked, so hardware IR validation, calibration, and a Home
+Assistant deployment are still required before use.

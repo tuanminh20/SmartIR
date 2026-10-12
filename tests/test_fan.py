@@ -1,4 +1,6 @@
 """Fan feedback tests using real Home Assistant states and event listeners."""
+import json
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -14,12 +16,7 @@ WATTS = 'sensor.sonoff_1002a3d31c_power'
 SPEEDS = [str(i) for i in range(1, 10)]
 # Synthetic ranges for tests only, not Panasonic calibration data.
 RANGES = {speed: [10 * i, 10 * (i + 1)] for i, speed in enumerate(SPEEDS)}
-DEVICE = {
-    'manufacturer': 'Panasonic', 'supportedModels': ['test fixture'],
-    'supportedController': 'Broadlink', 'commandsEncoding': 'Base64',
-    'speed': SPEEDS,
-    'commands': {'off': 'test-off', 'default': {s: 'test-' + s for s in SPEEDS}},
-}
+DEVICE = json.loads((Path(__file__).resolve().parents[1] / 'codes/fan/1221.json').read_text())
 BASE_CONFIG = {
     'platform': 'smartir', 'device_code': 1221,
     'controller_data': 'remote.test', 'power_sensor': POWER,
@@ -201,7 +198,7 @@ async def test_manual_commands_still_send_and_cancel_pending(hass, monkeypatch, 
     await entity.async_set_percentage(100)
     assert pending.cancelled
     assert entity._speed == '9'
-    entity._controller.send.assert_awaited_once_with('test-9')
+    entity._controller.send.assert_awaited_once_with(DEVICE['commands']['default']['9'])
     await entity.async_turn_off()
     assert entity.percentage == 0
     await entity.async_turn_on()

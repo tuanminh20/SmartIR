@@ -51,9 +51,14 @@ still send commands as before.
 
 ### Panasonic 1221 calibration template
 
-Keep your existing `custom_components/smartir/codes/fan/1221.json` with speed
-strings `"1"` through `"9"`. This repository does not currently include that file;
-this feature does not add or change device IR codes.
+The [Panasonic 1221 device file](../codes/fan/1221.json) supports F-60GDN and
+F-60GDS with Broadlink and speed strings `"1"` through `"9"`. Its IR codes were
+supplied by the user and have not been tested against hardware. If this file is
+already installed in `custom_components/smartir/codes/fan/1221.json`, keep it;
+speed feedback does not modify IR commands. For a new installation, copy
+`codes/fan/1221.json` from this fork to
+`custom_components/smartir/codes/fan/1221.json` manually. The automatic device
+downloader still uses upstream SmartIR, where this file may not be available.
 
 **The following is a template, not a runnable configuration.** Replace every
 `MIN_*_W` and `MAX_*_W` with measured numeric watt limits before enabling speed
@@ -277,6 +282,12 @@ Contributing to your own code files is welcome. However, we do not accept incomp
 | Code | Supported Models | Controller |
 | ------------- | -------------------------- | ------------- |
 [1220](../codes/fan/1220.json)|C56-RW5|Broadlink
+
+#### Panasonic
+
+| Code | Supported Models | Controller |
+| ------------- | -------------------------- | ------------- |
+[1221](../codes/fan/1221.json)|F-60GDN, F-60GDS|Broadlink
 
 #### Mallory
 

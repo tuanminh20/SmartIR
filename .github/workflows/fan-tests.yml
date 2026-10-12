@@ -5,12 +5,14 @@ on:
     branches: [master]
     paths:
       - custom_components/smartir/**
+      - codes/fan/1221.json
       - tests/**
       - .github/workflows/fan-tests.yml
   push:
     branches: [master]
     paths:
       - custom_components/smartir/**
+      - codes/fan/1221.json
       - tests/**
       - .github/workflows/fan-tests.yml
 
