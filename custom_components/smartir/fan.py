@@ -2,6 +2,7 @@ import asyncio
 import aiofiles
 import json
 import logging
+import math
 import os.path
 
 import voluptuous as vol
@@ -10,9 +11,9 @@ from homeassistant.components.fan import (
     FanEntity, FanEntityFeature,
     PLATFORM_SCHEMA, DIRECTION_REVERSE, DIRECTION_FORWARD)
 from homeassistant.const import (
-    CONF_NAME, STATE_OFF, STATE_ON, STATE_UNKNOWN)
+    CONF_NAME, STATE_OFF, STATE_ON)
 from homeassistant.core import Event, EventStateChangedData, callback
-from homeassistant.helpers.event import async_track_state_change, async_track_state_change_event
+from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util.percentage import (
@@ -32,17 +33,50 @@ CONF_DEVICE_CODE = 'device_code'
 CONF_CONTROLLER_DATA = "controller_data"
 CONF_DELAY = "delay"
 CONF_POWER_SENSOR = 'power_sensor'
+CONF_POWER_SPEED_SENSOR = 'power_speed_sensor'
+CONF_POWER_SPEED_MAP = 'power_speed_map'
+CONF_POWER_SPEED_DELAY = 'power_speed_delay'
 
 SPEED_OFF = "off"
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
+def _nonnegative_finite(value):
+    """Validate watt limits and settling time without accepting NaN/infinity."""
+    value = vol.Coerce(float)(value)
+    if not math.isfinite(value) or value < 0:
+        raise vol.Invalid('Expected a finite, nonnegative number')
+    return value
+
+
+def _validate_power_speed_config(config):
+    """Require explicit ranges and an on/off sensor for speed feedback."""
+    if CONF_POWER_SPEED_SENSOR in config or CONF_POWER_SPEED_MAP in config:
+        for key in (CONF_POWER_SENSOR, CONF_POWER_SPEED_SENSOR, CONF_POWER_SPEED_MAP):
+            if key not in config:
+                raise vol.Invalid('Power speed feedback requires ' + key)
+        ranges = sorted(config[CONF_POWER_SPEED_MAP].values())
+        if not ranges:
+            raise vol.Invalid('power_speed_map must not be empty')
+        for index, (lower, upper) in enumerate(ranges):
+            if lower >= upper:
+                raise vol.Invalid('Power ranges require min < max')
+            if index and lower < ranges[index - 1][1]:
+                raise vol.Invalid('Power ranges must not overlap')
+    return config
+
+
+PLATFORM_SCHEMA = vol.All(PLATFORM_SCHEMA.extend({
     vol.Optional(CONF_UNIQUE_ID): cv.string,
     vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
     vol.Required(CONF_DEVICE_CODE): cv.positive_int,
     vol.Required(CONF_CONTROLLER_DATA): cv.string,
     vol.Optional(CONF_DELAY, default=DEFAULT_DELAY): cv.string,
-    vol.Optional(CONF_POWER_SENSOR): cv.entity_id
-})
+    vol.Optional(CONF_POWER_SENSOR): cv.entity_id,
+    vol.Optional(CONF_POWER_SPEED_SENSOR): cv.entity_id,
+    vol.Optional(CONF_POWER_SPEED_MAP): {
+        str: vol.All([_nonnegative_finite], vol.Length(min=2, max=2))
+    },
+    vol.Optional(CONF_POWER_SPEED_DELAY, default=10): _nonnegative_finite,
+}), _validate_power_speed_config)
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
     """Set up the IR Fan platform."""
@@ -83,9 +117,12 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
         _LOGGER.error("The device JSON file is invalid")
         return
 
-    async_add_entities([SmartIRFan(
-        hass, config, device_data
-    )])
+    try:
+        fan = SmartIRFan(hass, config, device_data)
+    except vol.Invalid as error:
+        _LOGGER.error("Invalid fan power speed configuration: %s", error)
+        return
+    async_add_entities([fan])
 
 class SmartIRFan(FanEntity, RestoreEntity):
     def __init__(self, hass, config, device_data):
@@ -96,6 +133,11 @@ class SmartIRFan(FanEntity, RestoreEntity):
         self._controller_data = config.get(CONF_CONTROLLER_DATA)
         self._delay = config.get(CONF_DELAY)
         self._power_sensor = config.get(CONF_POWER_SENSOR)
+        self._power_speed_sensor = config.get(CONF_POWER_SPEED_SENSOR)
+        self._power_speed_map = config.get(CONF_POWER_SPEED_MAP, {})
+        self._power_speed_delay = config.get(CONF_POWER_SPEED_DELAY, 10)
+        self._pending_speed = None
+        self._cancel_speed_sync = None
 
         self._manufacturer = device_data['manufacturer']
         self._supported_models = device_data['supportedModels']
@@ -103,6 +145,8 @@ class SmartIRFan(FanEntity, RestoreEntity):
         self._commands_encoding = device_data['commandsEncoding']
         self._speed_list = device_data['speed']
         self._commands = device_data['commands']
+        if self._power_speed_sensor and set(self._power_speed_map) != set(self._speed_list):
+            raise vol.Invalid('power_speed_map must contain exactly the device speed strings')
         
         self._speed = SPEED_OFF
         self._direction = None
@@ -144,6 +188,17 @@ class SmartIRFan(FanEntity, RestoreEntity):
         if last_state is not None:
             if 'speed' in last_state.attributes:
                 self._speed = last_state.attributes['speed']
+            elif last_state.state == STATE_ON:
+                percentage = last_state.attributes.get('percentage')
+                if percentage is not None and 0 < percentage <= 100:
+                    self._speed = percentage_to_ordered_list_item(self._speed_list, percentage)
+                else:
+                    self._speed = None
+                    self._on_by_remote = True
+
+            if self._speed not in [SPEED_OFF, *self._speed_list]:
+                self._speed = None
+                self._on_by_remote = last_state.state == STATE_ON
 
             #If _direction has a value the direction controls appears 
             #in UI even if SUPPORT_DIRECTION is not provided in the flags
@@ -152,11 +207,19 @@ class SmartIRFan(FanEntity, RestoreEntity):
                 self._direction = last_state.attributes['direction']
 
             if 'last_on_speed' in last_state.attributes:
-                self._last_on_speed = last_state.attributes['last_on_speed']
+                speed = last_state.attributes['last_on_speed']
+                if speed in self._speed_list:
+                    self._last_on_speed = speed
 
-            if self._power_sensor:
-                async_track_state_change_event(self.hass, self._power_sensor, 
-                                               self._async_power_sensor_changed)
+        if self._power_sensor:
+            self.async_on_remove(async_track_state_change_event(
+                self.hass, self._power_sensor, self._async_power_sensor_changed))
+            self._sync_power_state()
+        if self._power_speed_sensor:
+            self.async_on_remove(async_track_state_change_event(
+                self.hass, self._power_speed_sensor, self._async_power_speed_sensor_changed))
+            self.async_on_remove(self._cancel_pending_speed)
+            self._schedule_speed_sync()
 
     @property
     def unique_id(self):
@@ -172,7 +235,7 @@ class SmartIRFan(FanEntity, RestoreEntity):
     def state(self):
         """Return the current state."""
         if (self._on_by_remote or \
-            self._speed != SPEED_OFF):
+            self._speed in self._speed_list):
             return STATE_ON
         return SPEED_OFF
 
@@ -181,6 +244,8 @@ class SmartIRFan(FanEntity, RestoreEntity):
         """Return speed percentage of the fan."""
         if (self._speed == SPEED_OFF):
             return 0
+        if self._speed not in self._speed_list:
+            return None
 
         return ordered_list_item_to_percentage(self._speed_list, self._speed)
 
@@ -223,6 +288,7 @@ class SmartIRFan(FanEntity, RestoreEntity):
 
     async def async_set_percentage(self, percentage: int):
         """Set the desired speed for the fan."""
+        self._cancel_pending_speed()
         if (percentage == 0):
              self._speed = SPEED_OFF
         else:
@@ -246,7 +312,7 @@ class SmartIRFan(FanEntity, RestoreEntity):
         """Set the direction of the fan"""
         self._direction = direction
 
-        if not self._speed.lower() == SPEED_OFF:
+        if self._speed in self._speed_list:
             await self.send_command()
 
         self.async_write_ha_state()
@@ -270,11 +336,13 @@ class SmartIRFan(FanEntity, RestoreEntity):
             direction = self._direction or 'default'
             oscillating = self._oscillating
 
-            if speed.lower() == SPEED_OFF:
+            if speed == SPEED_OFF:
                 command = self._commands['off']
             elif oscillating:
                 command = self._commands['oscillate']
             else:
+                if speed not in self._speed_list:
+                    return
                 command = self._commands[direction][speed] 
 
             try:
@@ -283,25 +351,79 @@ class SmartIRFan(FanEntity, RestoreEntity):
                 _LOGGER.exception(e)
 
     @callback
-    async def _async_power_sensor_changed(self, event: Event[EventStateChangedData]) -> None:
+    def _async_power_sensor_changed(self, event: Event[EventStateChangedData]) -> None:
         """Handle power sensor changes."""
-        entity_id = event.data["entity_id"]
-        old_state = event.data["old_state"]
-        new_state = event.data["new_state"]
+        self._sync_power_state()
+        self._schedule_speed_sync()
+        self.async_write_ha_state()
 
-        if new_state is None:
+    @callback
+    def _sync_power_state(self):
+        """Apply current on/off feedback, including the initial sensor state."""
+        state = self.hass.states.get(self._power_sensor)
+        if state is None:
             return
-
-        if new_state.state == old_state.state:
-            return
-
-        if new_state.state == STATE_ON and self._speed == SPEED_OFF:
+        if state.state == STATE_ON and self._speed == SPEED_OFF:
             self._on_by_remote = True
             self._speed = None
-            self.async_write_ha_state()
-
-        if new_state.state == STATE_OFF:
+        elif state.state == STATE_OFF:
             self._on_by_remote = False
-            if self._speed != SPEED_OFF:
-                self._speed = SPEED_OFF
-            self.async_write_ha_state()
+            self._speed = SPEED_OFF
+
+    def _speed_from_power(self):
+        """Return a mapped speed only while on/off feedback confirms on."""
+        if not self._power_speed_sensor:
+            return None
+        running = self.hass.states.get(self._power_sensor)
+        power = self.hass.states.get(self._power_speed_sensor)
+        if running is None or running.state != STATE_ON or power is None:
+            return None
+        try:
+            watts = float(power.state)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(watts):
+            return None
+        for speed, (lower, upper) in self._power_speed_map.items():
+            if lower <= watts < upper:
+                return speed
+        return None
+
+    @callback
+    def _cancel_pending_speed(self):
+        """Cancel settling on invalid feedback, commands, or entity removal."""
+        if self._cancel_speed_sync is not None:
+            self._cancel_speed_sync()
+            self._cancel_speed_sync = None
+        self._pending_speed = None
+
+    @callback
+    def _async_power_speed_sensor_changed(self, event: Event[EventStateChangedData]) -> None:
+        self._schedule_speed_sync()
+
+    @callback
+    def _schedule_speed_sync(self):
+        """Require a continuously matching range, not an unchanged watt value."""
+        speed = self._speed_from_power()
+        if speed is None or speed == self._speed:
+            self._cancel_pending_speed()
+            return
+        if speed == self._pending_speed:
+            return
+        self._cancel_pending_speed()
+        self._pending_speed = speed
+        self._cancel_speed_sync = async_call_later(
+            self.hass, self._power_speed_delay, self._apply_power_speed)
+
+    @callback
+    def _apply_power_speed(self, now):
+        """Update state only; never invoke a control service or send IR."""
+        speed = self._pending_speed
+        self._cancel_speed_sync = None
+        self._pending_speed = None
+        if speed is None or self._speed_from_power() != speed:
+            return
+        self._speed = speed
+        self._last_on_speed = speed
+        self._on_by_remote = True
+        self.async_write_ha_state()
