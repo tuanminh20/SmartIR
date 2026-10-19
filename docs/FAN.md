@@ -14,6 +14,43 @@ Find your device's brand code [here](FAN.md#available-codes-for-fan-devices) and
 **delay** (Optional): Adjusts the delay in seconds between multiple commands. The default is 0.5 <br />
 **power_sensor** (Optional): *entity_id* for a sensor that monitors whether your device is actually On or Off. This may be a power monitor sensor. (Accepts only on/off states)<br />
 
+## Sync state from HAIR or a physical remote
+
+After HAIR recognizes an **absolute** speed or off command, call
+`smartir.sync_fan_state` targeting the existing SmartIR fan. This updates Home
+Assistant state immediately without sending IR/RF or creating another entity.
+Use this action in the automation triggered by your learned HAIR command:
+
+```yaml
+action: smartir.sync_fan_state
+target:
+  entity_id: fan.panasonic_ceiling_fan
+data:
+  speed: "3"
+```
+
+Use `speed: "off"` for off. `speed` is required and must be a string: either
+`"off"` or an exact speed from the target device JSON (`"1"` through `"9"` for
+Panasonic 1221). Numeric YAML values, percentages, `"on"`, and unsupported speed
+names are rejected. Other models can use their own speed strings, such as
+`"low"`. Validation is per entity; when targeting several fans, valid targets
+can update even if another target rejects that speed. Prefer one fan per HAIR
+automation. Toggle or speed-cycle remote commands require separate logic to
+determine the actual resulting speed.
+
+The action updates on/off state, percentage, and `last_on_speed`. Off preserves
+the last running speed so a later normal `fan.turn_on` resumes it. Direction and
+oscillation are preserved. Only SmartIR fan entities receive the action; fans
+from other integrations are ignored by Home Assistant's entity service dispatch.
+The action is registered when a SmartIR fan platform is successfully set up.
+
+An observation cancels pending power-speed settling to prevent old feedback
+from overwriting it. It does not change the sensors or configuration. The
+observation is applied immediately, including when a sensor still reports an
+older value; subsequent `power_sensor` and `power_speed_sensor` events retain
+their existing behavior and can update the state again. Ordinary fan control
+actions continue to transmit commands. No HAIR dependency is required in SmartIR.
+
 ## Optional speed feedback from measured power
 
 **power_speed_sensor** (Optional): Entity ID of a numeric sensor reporting watts (W).

@@ -2,3 +2,18 @@ check_updates:
   description: Check for SmartIR updates.
 update_component:
   description: Update SmartIR component.
+sync_fan_state:
+  name: Sync fan state
+  description: Update an observed SmartIR fan speed without transmitting IR or RF.
+  target:
+    entity:
+      integration: smartir
+      domain: fan
+  fields:
+    speed:
+      name: Speed
+      description: 'Exact speed string from the device JSON, or "off". Quote numeric speeds.'
+      required: true
+      example: "3"
+      selector:
+        text:

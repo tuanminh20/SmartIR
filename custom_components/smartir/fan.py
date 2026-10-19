@@ -13,6 +13,8 @@ from homeassistant.components.fan import (
 from homeassistant.const import (
     CONF_NAME, STATE_OFF, STATE_ON)
 from homeassistant.core import Event, EventStateChangedData, callback
+from homeassistant.exceptions import ServiceValidationError
+from homeassistant.helpers import entity_platform
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -123,6 +125,11 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
         _LOGGER.error("Invalid fan power speed configuration: %s", error)
         return
     async_add_entities([fan])
+    entity_platform.async_get_current_platform().async_register_entity_service(
+        'sync_fan_state',
+        {vol.Required('speed'): str},
+        'async_sync_fan_state',
+    )
 
 class SmartIRFan(FanEntity, RestoreEntity):
     def __init__(self, hass, config, device_data):
@@ -285,6 +292,21 @@ class SmartIRFan(FanEntity, RestoreEntity):
             'supported_controller': self._supported_controller,
             'commands_encoding': self._commands_encoding,
         }
+
+    async def async_sync_fan_state(self, speed: str):
+        """Apply an observed remote speed without transmitting IR/RF."""
+        if not isinstance(speed, str) or speed not in [SPEED_OFF, *self._speed_list]:
+            raise ServiceValidationError(
+                f"Invalid speed {speed!r} for {self.entity_id}; "
+                f"expected one of {[SPEED_OFF, *self._speed_list]}"
+            )
+
+        self._cancel_pending_speed()
+        self._speed = speed
+        self._on_by_remote = speed != SPEED_OFF
+        if speed != SPEED_OFF:
+            self._last_on_speed = speed
+        self.async_write_ha_state()
 
     async def async_set_percentage(self, percentage: int):
         """Set the desired speed for the fan."""
