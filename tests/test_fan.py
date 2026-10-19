@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 import pytest_asyncio
-import voluptuous as vol
 from homeassistant.core import HomeAssistant, State
+import voluptuous as vol
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from custom_components.smartir import fan as fan_module
@@ -270,3 +270,188 @@ async def test_half_open_ranges_and_gaps(hass, monkeypatch, timers):
     hass.states.async_set(WATTS, '7')
     assert entity._speed_from_power() is None
     entity._call_on_remove_callbacks()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('speed', ['off', *SPEEDS])
+async def test_sync_observed_speed_without_ir(hass, monkeypatch, timers, speed):
+    hass.states.async_set(POWER, 'on')
+    hass.states.async_set(WATTS, '35')
+    entity = await create_fan(hass, monkeypatch)
+    pending = timers[-1]
+    entity._last_on_speed = '6'
+    entity._direction = 'forward'
+    entity._oscillating = True
+    await entity.async_sync_fan_state(speed)
+    assert pending.cancelled
+    assert entity._pending_speed is None
+    assert entity._cancel_speed_sync is None
+    assert entity._speed == speed
+    assert entity.state == ('off' if speed == 'off' else 'on')
+    assert entity.percentage == (0 if speed == 'off' else int(speed) * 100 // 9)
+    assert entity.last_on_speed == ('6' if speed == 'off' else speed)
+    assert entity._on_by_remote == (speed != 'off')
+    assert entity.current_direction == 'forward'
+    assert entity.oscillating is True
+    entity.async_write_ha_state.assert_called_once_with()
+    # A cancelled feedback callback cannot overwrite the observation.
+    pending.action(None)
+    assert entity._speed == speed
+    entity._controller.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('speed', ['10', '', 'ON', 'Off', ' 3', 3, None, True, ['3']])
+async def test_invalid_sync_has_no_side_effects(hass, monkeypatch, timers, speed):
+    from homeassistant.exceptions import ServiceValidationError
+
+    hass.states.async_set(POWER, 'on')
+    hass.states.async_set(WATTS, '35')
+    entity = await create_fan(hass, monkeypatch)
+    before = (entity._speed, entity._on_by_remote, entity.last_on_speed)
+    with pytest.raises(ServiceValidationError, match='Invalid speed'):
+        await entity.async_sync_fan_state(speed)
+    assert (entity._speed, entity._on_by_remote, entity.last_on_speed) == before
+    assert not timers[-1].cancelled
+    entity.async_write_ha_state.assert_not_called()
+    entity._controller.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sensors_and_controls_after_sync(hass, monkeypatch, timers):
+    entity = await create_fan(hass, monkeypatch)
+    await entity.async_sync_fan_state('7')
+    await set_state(hass, POWER, 'off')
+    assert entity.state == 'off'
+    assert entity.last_on_speed == '7'
+    await set_state(hass, POWER, 'on')
+    assert entity.percentage is None
+    await set_state(hass, WATTS, '45')
+    timers[-1].action(None)
+    assert entity._speed == '5'
+    entity._controller.send.assert_not_called()
+    await entity.async_sync_fan_state('8')
+    await entity.async_sync_fan_state('off')
+    await entity.async_turn_on()
+    assert entity._speed == '8'
+    entity._controller.send.assert_awaited_once_with(DEVICE['commands']['default']['8'])
+
+
+@pytest_asyncio.fixture
+async def service_fans(hass, monkeypatch, tmp_path):
+    """Exercise platform setup and actual HA service dispatch, not a mock registry."""
+    import logging
+    from datetime import timedelta
+    from homeassistant.helpers.entity_platform import EntityPlatform, current_platform
+
+    device_dir = tmp_path / 'codes' / 'fan'
+    device_dir.mkdir(parents=True)
+    (device_dir / '1221.json').write_text(json.dumps(DEVICE))
+    (device_dir / '1000.json').write_text(json.dumps(dict(DEVICE, speed=['low', 'high'])))
+    monkeypatch.setattr(fan_module, 'COMPONENT_ABS_DIR', str(tmp_path))
+    monkeypatch.setattr(fan_module, 'get_controller', lambda *args: Mock(send=AsyncMock()))
+    monkeypatch.setattr(RestoreEntity, 'async_added_to_hass', AsyncMock())
+    monkeypatch.setattr(RestoreEntity, 'async_get_last_state', AsyncMock(return_value=None))
+    entities = []
+    platforms = []
+    for code in (1221, 1000):
+        platform = EntityPlatform(
+            hass=hass, logger=logging.getLogger(__name__), domain='fan',
+            platform_name='smartir', platform=fan_module,
+            scan_interval=timedelta(seconds=30), entity_namespace=None,
+        )
+        platforms.append(platform)
+        token = current_platform.set(platform)
+        try:
+            await fan_module.async_setup_platform(
+                hass, fan_module.PLATFORM_SCHEMA(dict(BASE_CONFIG, device_code=code)),
+                entities.extend,
+            )
+        finally:
+            current_platform.reset(token)
+        entity = entities[-1]
+        entity.entity_id = f'fan.test_{code}'
+        entity.add_to_platform_start(hass, platform, None)
+        platform.entities[entity.entity_id] = entity
+        platform.domain_entities[entity.entity_id] = entity
+        platform.domain_platform_entities[entity.entity_id] = entity
+        await entity.add_to_platform_finish()
+    yield entities
+    for entity in entities:
+        entity._call_on_remove_callbacks()
+
+
+@pytest.mark.asyncio
+async def test_service_dispatch_and_platform_isolation(hass, service_fans):
+    from homeassistant.components.fan import FanEntity
+    from homeassistant.helpers.entity_platform import DATA_DOMAIN_ENTITIES
+
+    assert hass.services.has_service('smartir', 'sync_fan_state')
+    assert not hass.services.has_service('fan', 'sync_fan_state')
+    other = FanEntity()
+    other.entity_id = 'fan.other'
+    other.async_sync_fan_state = AsyncMock()
+    hass.data[DATA_DOMAIN_ENTITIES]['fan'][other.entity_id] = other
+    hass.states.async_set(other.entity_id, 'off')
+    # Only SmartIR entities are dispatched, even in mixed targets.
+    await hass.services.async_call('smartir', 'sync_fan_state', {
+        'entity_id': [service_fans[0].entity_id, other.entity_id], 'speed': '3',
+    }, blocking=True)
+    assert hass.states.get(service_fans[0].entity_id).attributes['percentage'] == 33
+    assert hass.states.get(service_fans[0].entity_id).state == 'on'
+    assert hass.states.get(service_fans[1].entity_id).state == 'off'
+    other.async_sync_fan_state.assert_not_called()
+    assert hass.states.get(other.entity_id).state == 'off'
+    await hass.services.async_call('smartir', 'sync_fan_state', {
+        'entity_id': service_fans[1].entity_id, 'speed': 'high',
+    }, blocking=True)
+    assert hass.states.get(service_fans[1].entity_id).attributes['percentage'] == 100
+    # Repeated setup must keep dispatch to all SmartIR fan platforms.
+    await hass.services.async_call('smartir', 'sync_fan_state', {
+        'entity_id': 'all', 'speed': 'off',
+    }, blocking=True)
+    for entity in service_fans:
+        assert hass.states.get(entity.entity_id).state == 'off'
+        entity._controller.send.assert_not_called()
+    other.async_sync_fan_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('data', [{}, {'speed': 3}, {'speed': None}, {'speed': True},
+                                  {'speed': ['3']}, {'speed': '10'}, {'speed': 'high'}])
+async def test_service_rejects_invalid_speed(hass, service_fans, data):
+    from homeassistant.exceptions import ServiceValidationError
+
+    with pytest.raises((vol.Invalid, ServiceValidationError)):
+        await hass.services.async_call('smartir', 'sync_fan_state',
+                                      dict(data, entity_id=service_fans[0].entity_id),
+                                      blocking=True)
+    assert hass.states.get(service_fans[0].entity_id).state == 'off'
+    service_fans[0]._controller.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('speed', ['7', 'off'])
+async def test_synced_state_survives_restore(hass, monkeypatch, service_fans, speed):
+    entity = service_fans[0]
+    for observed in ('7', speed, speed):
+        await hass.services.async_call('smartir', 'sync_fan_state', {
+            'entity_id': entity.entity_id, 'speed': observed,
+        }, blocking=True)
+    state = hass.states.get(entity.entity_id)
+    restored = await create_fan(hass, monkeypatch, feedback=False, restored=state)
+    assert restored.state == state.state
+    assert restored.percentage == state.attributes['percentage']
+    assert restored.last_on_speed == '7'
+    entity._controller.send.assert_not_called()
+    restored._controller.send.assert_not_called()
+    restored._call_on_remove_callbacks()
+
+
+@pytest.mark.asyncio
+async def test_sync_requires_a_target(hass, service_fans):
+    with pytest.raises(vol.Invalid):
+        await hass.services.async_call('smartir', 'sync_fan_state',
+                                      {'speed': 'off'}, blocking=True)
+    for entity in service_fans:
+        entity._controller.send.assert_not_called()
